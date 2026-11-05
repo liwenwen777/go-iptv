@@ -1,0 +1,24 @@
+services:
+  iptv:
+    # 指向自己 fork 自动构建出来的镜像；想锁版本就换成 :20261105 或 :sha-xxxxxxx
+    image: ${IPTV_IMAGE:-ghcr.io/liwenwen777/go-iptv:latest}
+    container_name: ${IPTV_NAME:-iptv-web}
+    # 进阶功能（apktool 重签客户端、写宿主机文件等）需要高权限
+    privileged: true
+    ports:
+      - "${IPTV_PORT:-8090}:80"
+      # HTTPS：只有后台「SSL 证书」页把 443 打开才会真正监听；
+      # 宿主机 443 被占用时把下面这行注释掉即可。
+      - "${IPTV_HTTPS_PORT:-443}:443"
+    volumes:
+      - ./data:/config
+    environment:
+      - TZ=Asia/Shanghai
+      - GOMEMLIMIT=1GiB
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/version"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
