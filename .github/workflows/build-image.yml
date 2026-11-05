@@ -1,0 +1,137 @@
+name: 构建镜像并推送到 GHCR
+
+# 说明：
+#   本仓库的 Dockerfile 不编译任何东西，它是「拉取上游预发布二进制 + 打包运行时」的装配型镜像。
+#   所以这里不需要 Go / Node 环境，buildx 一把梭即可。
+#   镜像推到 ghcr.io/<你的用户名>/go-iptv，用 GITHUB_TOKEN 登录，不用配任何 secret。
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Dockerfile'
+      - 'Dockerfile.web'
+      - 'client/**'
+      - 'apktool/**'
+      - 'nginx/**'
+      - 'database/**'
+      - 'logo/**'
+      - 'mytv/**'
+      - 'config.yml'
+      - 'keystore.p12'
+      - '.github/workflows/build-image.yml'
+  schedule:
+    # 每周一 03:17 UTC 重建一次：Dockerfile 默认 API_VERSION=latest，
+    # 跑一次就能自动跟到上游最新稳定版，不用手动点。
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+    inputs:
+      api_version:
+        description: 'iptv-api 版本（留空 = latest，自动取上游最新稳定版）'
+        required: false
+        default: ''
+      engine_version:
+        description: '引擎版本（留空 = latest）'
+        required: false
+        default: ''
+      apk_mirror:
+        description: 'Alpine 软件源镜像'
+        required: false
+        default: 'https://mirrors.tuna.tsinghua.edu.cn/alpine'
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build:
+    name: build amd64 image
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 计算镜像名与标签
+        id: vars
+        run: |
+          set -euo pipefail
+          # GHCR 要求仓库名全小写
+          IMG="${REGISTRY}/$(printf '%s' "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+          echo "image=${IMG}" >> "$GITHUB_OUTPUT"
+          {
+            echo "tags<<__TAGS_EOF__"
+            echo "${IMG}:latest"
+            echo "${IMG}:$(date -u +%Y%m%d)"
+            echo "${IMG}:sha-${GITHUB_SHA::7}"
+            echo "__TAGS_EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 准备 Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 构建并推送
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          # 上游发布资产只有 amd64（build-tools 是 x86_64 的 Google 官方包），
+          # arm64 下 aapt2/zipalign 根本跑不起来，所以这里只做单架构。
+          platforms: linux/amd64
+          push: true
+          load: true
+          provenance: false
+          sbom: false
+          tags: ${{ steps.vars.outputs.tags }}
+          build-args: |
+            APK_MIRROR=${{ github.event.inputs.apk_mirror || 'https://mirrors.tuna.tsinghua.edu.cn/alpine' }}
+            API_VERSION=${{ github.event.inputs.api_version || 'latest' }}
+            ENGINE_VERSION=${{ github.event.inputs.engine_version || 'latest' }}
+          secrets: |
+            gh_token=${{ secrets.GITHUB_TOKEN }}
+          cache-from: type=gha,scope=iptv-image
+          cache-to: type=gha,scope=iptv-image,mode=max
+
+      - name: 冒烟测试（镜像里的二进制能不能跑）
+        run: |
+          set -euo pipefail
+          IMG="${{ steps.vars.outputs.image }}:sha-${GITHUB_SHA::7}"
+          echo "== /app/iptv -version =="
+          docker run --rm --entrypoint /app/iptv "$IMG" -version
+          echo "== /app/engine -version =="
+          docker run --rm --entrypoint /app/engine "$IMG" -version
+          echo "== 基础客户端是否就位 =="
+          docker run --rm --entrypoint /bin/sh "$IMG" -c 'ls -l /app/client'
+
+      - name: 写完给个拉取提示
+        run: |
+          {
+            echo "### 镜像已推送"
+            echo ""
+            echo '```'
+            echo "docker pull ${{ steps.vars.outputs.image }}:latest"
+            echo '```'
+            echo ""
+            echo "首次拉取需要在目标机器上登录 GHCR（包默认私有）："
+            echo ""
+            echo '```bash'
+            echo "echo <你的GitHub_PAT> | docker login ghcr.io -u ${{ github.actor }} --password-stdin"
+            echo '```'
+            echo ""
+            echo "想公开拉取：仓库 → Packages → 该镜像 → Package settings → Change visibility → Public"
+          } >> "$GITHUB_STEP_SUMMARY"
