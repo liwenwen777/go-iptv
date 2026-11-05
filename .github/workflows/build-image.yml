@@ -1,15 +1,15 @@
 name: 构建镜像并推送到 GHCR
 
-# 说明：
-#   本仓库的 Dockerfile 不编译任何东西，它是「拉取上游预发布二进制 + 打包运行时」的装配型镜像。
-#   所以这里不需要 Go / Node 环境，buildx 一把梭即可。
-#   镜像推到 ghcr.io/<你的用户名>/go-iptv，用 GITHUB_TOKEN 登录，不用配任何 secret。
+# 为什么不直接 build Dockerfile：
+#   Dockerfile 的 fetch 阶段要从 wz1st/iptv-start 的 releases 下 start_amd64，
+#   但那个仓库只发 tag、从不发 release 资产 → 必然 404。
+#   官方镜像是走「编译 start + 下载 api/engine/web 预编译产物 + Dockerfile.web 组装」，
+#   这里照同一条路走，只是把最终产物从 Docker Hub 换成 ghcr.io。
 
 on:
   push:
     branches: [main]
     paths:
-      - 'Dockerfile'
       - 'Dockerfile.web'
       - 'client/**'
       - 'apktool/**'
@@ -19,15 +19,16 @@ on:
       - 'mytv/**'
       - 'config.yml'
       - 'keystore.p12'
+      - 'dictionary.txt'
+      - 'alias.json'
       - '.github/workflows/build-image.yml'
   schedule:
-    # 每周一 03:17 UTC 重建一次：Dockerfile 默认 API_VERSION=latest，
-    # 跑一次就能自动跟到上游最新稳定版，不用手动点。
+    # 每周一 03:17 UTC 重建，自动跟上游最新稳定版
     - cron: '17 3 * * 1'
   workflow_dispatch:
     inputs:
       api_version:
-        description: 'iptv-api 版本（留空 = latest，自动取上游最新稳定版）'
+        description: 'api 版本（留空 = latest，自动取上游最新稳定版）'
         required: false
         default: ''
       engine_version:
@@ -49,22 +50,149 @@ concurrency:
 
 env:
   REGISTRY: ghcr.io
+  UPSTREAM: wz1st/go-iptv
+  START_REPO: wz1st/iptv-start
+  GO_VERSION: '1.25'
 
 jobs:
-  build:
-    name: build amd64 image
+  # ── 1. 定版本 ────────────────────────────────────────────────
+  prepare:
+    name: 解析版本
     runs-on: ubuntu-latest
-    timeout-minutes: 90
-
+    timeout-minutes: 10
+    outputs:
+      api_tag: ${{ steps.pick.outputs.api_tag }}
+      engine_tag: ${{ steps.pick.outputs.engine_tag }}
     steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
+      - name: 挑最新的 api / engine
+        id: pick
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IN_API: ${{ github.event.inputs.api_version }}
+          IN_ENGINE: ${{ github.event.inputs.engine_version }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${IN_API:-}" ]; then
+            API_TAG="$IN_API"
+          else
+            API_TAG=$(gh api --paginate "repos/$UPSTREAM/releases?per_page=100" | jq -rs '
+              add // []
+              | [ .[]
+                  | select((.prerelease | not)
+                           and (.tag_name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))
+                           and ([.assets[]?.name] | index("SHA256SUMS.txt") != null)
+                           and ([.assets[]?.name] | index("webdist.tar.gz") != null)
+                           and ([.assets[]?.name] | index("SHA256SUMSEngine.txt") == null)) ]
+              | sort_by(.tag_name | ltrimstr("v") | split(".") | map(tonumber))
+              | (last // {}) | .tag_name // empty' | tr -d '"\r')
+          fi
+
+          if [ -n "${IN_ENGINE:-}" ]; then
+            case "$IN_ENGINE" in
+              engine-*) ENGINE_TAG="$IN_ENGINE" ;;
+              *)        ENGINE_TAG="engine-$IN_ENGINE" ;;
+            esac
+          else
+            ENGINE_TAG=$(gh api --paginate "repos/$UPSTREAM/releases?per_page=100" | jq -rs '
+              add // []
+              | [ .[]
+                  | select((.prerelease | not)
+                           and (.tag_name | test("^engine-v[0-9]+\\.[0-9]+\\.[0-9]+$"))
+                           and ([.assets[]?.name] | index("engine_amd64") != null)
+                           and ([.assets[]?.name] | index("SHA256SUMSEngine.txt") != null)) ]
+              | sort_by(.tag_name | ltrimstr("engine-v") | split(".") | map(tonumber))
+              | (last // {}) | .tag_name // empty' | tr -d '"\r')
+          fi
+
+          [ -n "$API_TAG" ]    || { echo "::error::没找到可用的 api release（需要带 SHA256SUMS.txt 和 webdist.tar.gz）"; exit 1; }
+          [ -n "$ENGINE_TAG" ] || { echo "::error::没找到可用的 engine release"; exit 1; }
+
+          echo "api_tag=$API_TAG"       >> "$GITHUB_OUTPUT"
+          echo "engine_tag=$ENGINE_TAG" >> "$GITHUB_OUTPUT"
+          echo "本次打包：api=$API_TAG engine=$ENGINE_TAG"
+
+  # ── 2. 编译启动器（唯一需要编译的部分）─────────────────────
+  start:
+    name: 编译 start_amd64
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.START_REPO }}
+          path: start-src
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: start-src/go.sum
+
+      - name: 编译
+        run: |
+          set -e
+          cd start-src
+          mkdir -p ../start_all
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -ldflags '-s -w' -o ../start_all/start_amd64 .
+          ls -l ../start_all
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: start_all
+          path: start_all
+          if-no-files-found: error
+          retention-days: 3
+
+  # ── 3. 装配镜像 ──────────────────────────────────────────────
+  image:
+    name: 组装并推送镜像
+    needs: [prepare, start]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: start_all
+          path: start_all
+
+      - name: 下载 api / engine / 前端产物并校验
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          API_TAG: ${{ needs.prepare.outputs.api_tag }}
+          ENGINE_TAG: ${{ needs.prepare.outputs.engine_tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p dl dl_eng iptv_all engine_all
+
+          gh release download "$API_TAG" --repo "$UPSTREAM" --dir dl --clobber \
+            --pattern 'iptv_amd64' --pattern 'SHA256SUMS.txt' --pattern 'webdist.tar.gz'
+          gh release download "$ENGINE_TAG" --repo "$UPSTREAM" --dir dl_eng --clobber \
+            --pattern 'engine_amd64' --pattern 'SHA256SUMSEngine.txt'
+
+          ls -l dl dl_eng
+          ( cd dl && sha256sum -c --ignore-missing SHA256SUMS.txt )
+          ( cd dl_eng && sha256sum -c SHA256SUMSEngine.txt )
+
+          mv dl/iptv_amd64 iptv_all/iptv_amd64
+          mv dl_eng/engine_amd64 engine_all/engine_amd64
+          chmod +x iptv_all/iptv_amd64 engine_all/engine_amd64 start_all/start_amd64
+
+          # 前端整包解开，Dockerfile.web 里是 COPY webdist /app/web
+          tar -xzf dl/webdist.tar.gz -C .
+          test -f webdist/index.html || { echo "::error::前端包里没有 webdist/index.html"; ls -R webdist | head; exit 1; }
+
+          # 版本一致性：前端里的标记应当等于 api 版本
+          grep -q "name=\"app-version\" content=\"$API_TAG\"" webdist/index.html \
+            || echo "::warning::前端版本标记与 api $API_TAG 不一致：$(grep -o 'name=\"app-version\"[^>]*' webdist/index.html | head -1)"
 
       - name: 计算镜像名与标签
         id: vars
         run: |
           set -euo pipefail
-          # GHCR 要求仓库名全小写
           IMG="${REGISTRY}/$(printf '%s' "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
           echo "image=${IMG}" >> "$GITHUB_OUTPUT"
           {
@@ -89,9 +217,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile
-          # 上游发布资产只有 amd64（build-tools 是 x86_64 的 Google 官方包），
-          # arm64 下 aapt2/zipalign 根本跑不起来，所以这里只做单架构。
+          file: ./Dockerfile.web
           platforms: linux/amd64
           push: true
           load: true
@@ -100,38 +226,33 @@ jobs:
           tags: ${{ steps.vars.outputs.tags }}
           build-args: |
             APK_MIRROR=${{ github.event.inputs.apk_mirror || 'https://mirrors.tuna.tsinghua.edu.cn/alpine' }}
-            API_VERSION=${{ github.event.inputs.api_version || 'latest' }}
-            ENGINE_VERSION=${{ github.event.inputs.engine_version || 'latest' }}
-          secrets: |
-            gh_token=${{ secrets.GITHUB_TOKEN }}
+            APP_VERSION=${{ needs.prepare.outputs.api_tag }}
           cache-from: type=gha,scope=iptv-image
           cache-to: type=gha,scope=iptv-image,mode=max
 
-      - name: 冒烟测试（镜像里的二进制能不能跑）
+      - name: 冒烟测试
         run: |
           set -euo pipefail
           IMG="${{ steps.vars.outputs.image }}:sha-${GITHUB_SHA::7}"
-          echo "== /app/iptv -version =="
-          docker run --rm --entrypoint /app/iptv "$IMG" -version
-          echo "== /app/engine -version =="
-          docker run --rm --entrypoint /app/engine "$IMG" -version
-          echo "== 基础客户端是否就位 =="
+          echo "== 内置版本 =="
+          docker run --rm --entrypoint cat "$IMG" /app/image-versions.txt
+          echo "== 客户端基座 =="
           docker run --rm --entrypoint /bin/sh "$IMG" -c 'ls -l /app/client'
+          echo "== 二进制自检 =="
+          docker run --rm --entrypoint /app/iptv "$IMG" -version
+          docker run --rm --entrypoint /app/engine "$IMG" -version
 
-      - name: 写完给个拉取提示
+      - name: 拉取提示
+        if: always()
         run: |
           {
-            echo "### 镜像已推送"
-            echo ""
+            echo "### 镜像"
             echo '```'
-            echo "docker pull ${{ steps.vars.outputs.image }}:latest"
-            echo '```'
-            echo ""
-            echo "首次拉取需要在目标机器上登录 GHCR（包默认私有）："
-            echo ""
-            echo '```bash'
-            echo "echo <你的GitHub_PAT> | docker login ghcr.io -u ${{ github.actor }} --password-stdin"
+            echo "${{ steps.vars.outputs.image }}:latest"
+            echo "${{ steps.vars.outputs.image }}:$(date -u +%Y%m%d)"
             echo '```'
             echo ""
-            echo "想公开拉取：仓库 → Packages → 该镜像 → Package settings → Change visibility → Public"
+            echo "api = \`${{ needs.prepare.outputs.api_tag }}\` / engine = \`${{ needs.prepare.outputs.engine_tag }}\`"
+            echo ""
+            echo "包默认私有：要么改成 Public，要么先 \`docker login ghcr.io\`。"
           } >> "$GITHUB_STEP_SUMMARY"
